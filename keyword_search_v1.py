@@ -1,94 +1,253 @@
-import pandas as pd
-from pytrends.request import TrendReq
-import time
+"""Collect Google Trends interest-over-time data for keywords in a CSV file.
+
+This tool uses pytrends, an unofficial Google Trends interface. Scores from
+separate batches are normalized independently by Google Trends and should not
+be treated as directly comparable across batches.
+"""
+
+from __future__ import annotations
+
 import argparse
-import contextlib
-import os.path
-import datetime
+import logging
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Sequence
 
-def scrape_google(term):
-    # Scrape Google Trends data for a given term
-    pytrends = TrendReq()
-    time.sleep(5)
-    
-    # Define the date range for the data
-    first_date = (
-        datetime.datetime.now() - datetime.timedelta(days=30)
-    ).strftime('%Y-%m-%d')
-    second_date = (
-        datetime.datetime.now() - datetime.timedelta(days=395)
-    ).strftime('%Y-%m-%d')
-    
-    with contextlib.suppress(Exception):
-        # Build the payload for the specified term and date range
-        pytrends.build_payload(term, cat=0, timeframe=f'{second_date} {first_date}', geo='PR', gprop='')
-        
-        # Get the interest over time data
-        trends = pytrends.interest_over_time()
-        
-        with contextlib.suppress(Exception):
-            # Drop unnecessary columns
-            trends = trends.drop(columns=['isPartial'])
-            trends = trends.drop(columns=['Caguas'])
-        
-        # Reset the index of the data frame
-        trends = trends.reset_index()
-        trends.date = trends.date.astype(str)
-        return trends
+import pandas as pd
 
-def get_trends(terms, trends, output_file):
-    # Get trends data for multiple terms
-    for i in range(4, len(terms), 4):
-        time.sleep(5)
-        terms_grouped = terms[i:i+4]
-        terms_grouped.append('Caguas')
-        
-        # Merge the trends data for the current group of terms
-        trends = pd.merge(trends, scrape_google(terms_grouped), on='date', how='right')
-        
-        print(f'columns: {len(list(trends))}, rows: {len(trends)}')
-        
-        # Save the merged trends data to the output file
-        trends.to_csv(output_file, index=False, encoding='utf-8-sig')
-    return trends
+LOGGER = logging.getLogger("google_trends_scraper")
 
-def main():
-    # Parse command-line arguments
-    argv = get_args()
-    
-    # Read the terms from the input CSV file
-    terms_table = pd.read_csv(argv.csv)
-    
-    # Remove rows with empty values in the specified column
-    terms_table = terms_table[terms_table[argv.col_name].notna()]
-    
-    # Extract the terms from the table
-    terms = list(terms_table[argv.col_name])
-    
-    if os.path.isfile(argv.output_file):
-        # If the output file already exists, read the trends data from it
-        trends = pd.read_csv(argv.output_file)
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Collect Google Trends interest-over-time data from a CSV of keywords."
+    )
+    parser.add_argument("--input", "-i", required=True, type=Path, help="Input CSV path.")
+    parser.add_argument(
+        "--column", "-c", required=True, help="Name of the CSV column containing keywords."
+    )
+    parser.add_argument("--output", "-o", required=True, type=Path, help="Output CSV path.")
+    parser.add_argument(
+        "--geo", default="PR", help="Google Trends geographic code (default: PR, Puerto Rico)."
+    )
+    parser.add_argument(
+        "--start-date", required=True, help="Start date, YYYY-MM-DD (inclusive)."
+    )
+    parser.add_argument(
+        "--end-date", required=True, help="End date, YYYY-MM-DD."
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=5,
+        help="Number of keywords per request, from 1 to 5 (default: 5)."
+    )
+    parser.add_argument(
+        "--pause", type=float, default=5.0,
+        help="Seconds to wait between requests; must be non-negative (default: 5)."
+    )
+    parser.add_argument(
+        "--language", default="en-US", help="Google Trends interface language (default: en-US)."
+    )
+    parser.add_argument(
+        "--retries", type=int, default=2,
+        help="Additional attempts after a failed request (default: 2)."
+    )
+    parser.add_argument(
+        "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO",
+        help="Logging verbosity (default: INFO)."
+    )
+    args = parser.parse_args(argv)
+
+    if args.batch_size < 1 or args.batch_size > 5:
+        parser.error("--batch-size must be between 1 and 5 because Google Trends accepts at most five terms per request.")
+    if args.pause < 0:
+        parser.error("--pause must be zero or greater.")
+    if args.retries < 0:
+        parser.error("--retries must be zero or greater.")
+    try:
+        start = pd.Timestamp(args.start_date)
+        end = pd.Timestamp(args.end_date)
+    except (TypeError, ValueError):
+        parser.error("Dates must be valid dates in YYYY-MM-DD format.")
+    if start > end:
+        parser.error("--start-date must be on or before --end-date.")
+    # Keep the CLI contract unambiguous and avoid accepting timestamps accidentally.
+    if start.strftime("%Y-%m-%d") != args.start_date or end.strftime("%Y-%m-%d") != args.end_date:
+        parser.error("Dates must use YYYY-MM-DD format.")
+    return args
+
+
+def load_keywords(input_path: Path, column: str) -> list[str]:
+    """Load unique, non-empty keywords from the requested CSV column."""
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input CSV not found: {input_path}")
+    try:
+        table = pd.read_csv(input_path)
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"Input CSV is empty: {input_path}") from exc
+    if column not in table.columns:
+        available = ", ".join(map(str, table.columns)) or "(none)"
+        raise ValueError(f"Column {column!r} was not found. Available columns: {available}")
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for value in table[column].dropna():
+        keyword = str(value).strip()
+        if keyword and keyword not in seen:
+            keywords.append(keyword)
+            seen.add(keyword)
+    if not keywords:
+        raise ValueError(f"No non-empty keywords found in column {column!r}.")
+    return keywords
+
+
+def collect_batch(
+    client: Any,
+    keywords: list[str],
+    geo: str,
+    start_date: str,
+    end_date: str,
+    retries: int = 2,
+    pause: float = 5.0,
+) -> pd.DataFrame:
+    """Fetch one batch and return a DataFrame with a date column."""
+    timeframe = f"{start_date} {end_date}"
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            client.build_payload(keywords, cat=0, timeframe=timeframe, geo=geo, gprop="")
+            result = client.interest_over_time()
+            if result is None or result.empty:
+                raise ValueError("Google Trends returned no data for this batch.")
+            result = result.drop(columns=["isPartial"], errors="ignore").reset_index()
+            if "date" not in result.columns:
+                # pytrends normally returns a DatetimeIndex named 'date'.
+                first_column = result.columns[0]
+                result = result.rename(columns={first_column: "date"})
+            missing = [keyword for keyword in keywords if keyword not in result.columns]
+            if missing:
+                raise ValueError(
+                    "Google Trends response did not include expected keyword column(s): "
+                    + ", ".join(repr(item) for item in missing)
+                )
+            result["date"] = pd.to_datetime(result["date"], errors="raise").dt.strftime("%Y-%m-%d")
+            return result[["date", *keywords]]
+        except Exception as exc:  # pytrends may raise several transport/API exception types
+            last_error = exc
+            if attempt < retries:
+                LOGGER.warning(
+                    "Request failed (%s/%s): %s. Retrying in %.1f seconds.",
+                    attempt + 1, retries + 1, exc, pause,
+                )
+                if pause:
+                    time.sleep(pause)
+    raise RuntimeError(f"Could not collect keywords {keywords!r}: {last_error}") from last_error
+
+
+def merge_batch(existing: pd.DataFrame, batch: pd.DataFrame) -> pd.DataFrame:
+    """Merge collected data by date, preserving existing values and columns."""
+    if existing.empty:
+        merged = batch.copy()
     else:
-        trends = pd.DataFrame([], columns=['date'])
-    
-    keywords_already_collected = list(trends)
-    
-    # Filter out terms that have already been collected
-    terms = [x for x in terms if x not in set(keywords_already_collected)]
-    
-    # Get trends data for the remaining terms
-    trends_data = get_trends(terms, trends, argv.output_file)
+        merged = existing.merge(batch, on="date", how="outer", suffixes=("", "__new"))
+        for column in batch.columns:
+            if column == "date":
+                continue
+            new_column = f"{column}__new"
+            if new_column in merged.columns:
+                merged[column] = merged[column].combine_first(merged[new_column])
+                merged = merged.drop(columns=[new_column])
+    merged["date"] = pd.to_datetime(merged["date"], errors="raise")
+    return merged.sort_values("date").assign(date=lambda frame: frame["date"].dt.strftime("%Y-%m-%d")).reset_index(drop=True)
 
-def get_args():
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Get Google Trends Data")
-    
-    parser.add_argument("-C", "--csv", type=str, required=True, help="CSV Table")
-    parser.add_argument("-N", "--col_name", type=str, required=True, help="Column with keyword name")
-    parser.add_argument("-O", "--output_file", type=str, required=True, help="Name of output file")
-    
-    return parser.parse_args()
+
+def save_csv_atomically(data: pd.DataFrame, output_path: Path) -> None:
+    """Write output to a temporary file before replacing the destination."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8-sig", newline="", suffix=".tmp",
+            dir=output_path.parent, delete=False,
+        ) as temp_file:
+            temp_name = temp_file.name
+            data.to_csv(temp_file, index=False)
+        os.replace(temp_name, output_path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def run(args: argparse.Namespace, client: TrendReq | None = None) -> int:
+    """Run the collection workflow. Returns the number of newly collected keywords."""
+    keywords = load_keywords(args.input, args.column)
+    if args.output.exists():
+        try:
+            existing = pd.read_csv(args.output, dtype={"date": str})
+        except pd.errors.EmptyDataError:
+            existing = pd.DataFrame(columns=["date"])
+        if "date" not in existing.columns:
+            raise ValueError(f"Existing output file must contain a 'date' column: {args.output}")
+        existing_keywords = [column for column in existing.columns if column != "date"]
+    else:
+        existing = pd.DataFrame(columns=["date"])
+        existing_keywords = []
+
+    pending = [keyword for keyword in keywords if keyword not in set(existing_keywords)]
+    if not pending:
+        LOGGER.info("All input keywords already exist in %s. Nothing to do.", args.output)
+        return 0
+
+    if client is None:
+        try:
+            from pytrends.request import TrendReq
+        except ImportError as exc:
+            raise RuntimeError(
+                "pytrends is not installed. Install dependencies with: python -m pip install -r requirements.txt"
+            ) from exc
+        client = TrendReq(hl=args.language)
+    collected = 0
+    batches = [pending[index:index + args.batch_size] for index in range(0, len(pending), args.batch_size)]
+    for index, batch_keywords in enumerate(batches, start=1):
+        LOGGER.info("Collecting batch %s/%s (%s keyword(s))", index, len(batches), len(batch_keywords))
+        batch = collect_batch(
+            client=client,
+            keywords=batch_keywords,
+            geo=args.geo,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            retries=args.retries,
+            pause=args.pause,
+        )
+        existing = merge_batch(existing, batch)
+        save_csv_atomically(existing, args.output)
+        collected += len(batch_keywords)
+        LOGGER.info("Saved %s rows and %s keyword(s) to %s", len(existing), len(existing.columns) - 1, args.output)
+        if index < len(batches) and args.pause:
+            time.sleep(args.pause)
+    return collected
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(levelname)s: %(message)s",
+    )
+    try:
+        count = run(args)
+    except (FileNotFoundError, ValueError, RuntimeError, OSError, pd.errors.ParserError) as exc:
+        LOGGER.error("%s", exc)
+        return 1
+    LOGGER.info("Finished. Newly collected keywords: %s", count)
+    LOGGER.warning(
+        "Google Trends scores are normalized per request. Scores from separate batches may not be directly comparable."
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    main()
-    print("Done")
+    sys.exit(main())
